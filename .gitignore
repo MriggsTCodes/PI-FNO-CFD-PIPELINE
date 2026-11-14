@@ -1,0 +1,28 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# PyTorch model checkpoints and large data caches
+*.pth
+*.pt
+data_cache/
+
+# Process and log files
+*.log
+*.pid
+
+# Scratch and temporary files
+scratch/
+scratch_*.py
+
+# Virtual environments
+venv/
+env/
+.venv/
+
+# IDE and OS metadata
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
