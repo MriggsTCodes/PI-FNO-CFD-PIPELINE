@@ -8,6 +8,9 @@ __pycache__/
 *.pt
 data_cache/
 
+# Results directory (checkpoints, evaluation reports, plots)
+results/
+
 # Process and log files
 *.log
 *.pid
