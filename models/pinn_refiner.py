@@ -43,6 +43,24 @@ class CyclicConv2d(nn.Module):
         return self.conv(pad_channel(x, self.pad))
 
 
+class CyclicResBlock(nn.Module):
+    """Residual block with cyclic boundary condition along x and GroupNorm."""
+    def __init__(self, channels: int):
+        super().__init__()
+        self.conv1 = CyclicConv2d(channels, channels, kernel_size=3)
+        self.norm1 = nn.GroupNorm(4, channels)
+        self.act1 = nn.GELU()
+        self.conv2 = CyclicConv2d(channels, channels, kernel_size=3)
+        self.norm2 = nn.GroupNorm(4, channels)
+        self.act2 = nn.GELU()
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        res = x
+        out = self.act1(self.norm1(self.conv1(x)))
+        out = self.norm2(self.conv2(out))
+        return self.act2(out + res)
+
+
 class PINN_Refiner(nn.Module):
     """
     Learned physics-informed correction network.
@@ -51,7 +69,7 @@ class PINN_Refiner(nn.Module):
     and outputs a residual correction Δ(u, v, p, T) that is added
     to the FNO prediction.
     
-    Uses 2D cyclic convolutions to preserve spatial gradients and
+    Uses 2D cyclic residual convolutions to preserve spatial gradients and
     channel periodicity, avoiding checkerboard artifacts of pointwise MLPs.
     
     Args:
@@ -65,22 +83,40 @@ class PINN_Refiner(nn.Module):
                  out_features: int = 4, num_layers: int = 4):
         super().__init__()
         
-        layers = []
-        layers.append(CyclicConv2d(in_features, hidden_features, kernel_size=3))
-        layers.append(nn.GELU())
+        self.in_proj = nn.Sequential(
+            CyclicConv2d(in_features, hidden_features, kernel_size=3),
+            nn.GroupNorm(4, hidden_features),
+            nn.GELU()
+        )
         
-        for _ in range(num_layers - 2):
-            layers.append(CyclicConv2d(hidden_features, hidden_features, kernel_size=3))
-            layers.append(nn.GroupNorm(4, hidden_features))
-            layers.append(nn.GELU())
+        # Stack of residual blocks
+        n_blocks = max(1, (num_layers - 2) // 2)
+        blocks = [CyclicResBlock(hidden_features) for _ in range(n_blocks)]
+        self.res_blocks = nn.Sequential(*blocks)
         
-        final_conv = CyclicConv2d(hidden_features, out_features, kernel_size=3)
+        self.out_conv = CyclicConv2d(hidden_features, out_features, kernel_size=3)
         # Initialize final layer to zero (start with exactly zero correction)
-        nn.init.zeros_(final_conv.conv.weight)
-        nn.init.zeros_(final_conv.conv.bias)
-        layers.append(final_conv)
+        nn.init.zeros_(self.out_conv.conv.weight)
+        nn.init.zeros_(self.out_conv.conv.bias)
+    
+    def load_state_dict(self, state_dict, strict=False):
+        """Robust state_dict loader that supports both legacy sequential and residual checkpoints."""
+        is_legacy = any(k.startswith('net.') for k in state_dict.keys())
+        is_current_res = hasattr(self, 'in_proj')
         
-        self.net = nn.Sequential(*layers)
+        if is_legacy and is_current_res:
+            mapped_dict = {}
+            for k, v in state_dict.items():
+                new_k = k
+                new_k = new_k.replace('net.0.', 'in_proj.0.')
+                new_k = new_k.replace('net.2.', 'res_blocks.0.conv1.')
+                new_k = new_k.replace('net.3.', 'res_blocks.0.norm1.')
+                new_k = new_k.replace('net.5.', 'res_blocks.0.conv2.')
+                new_k = new_k.replace('net.6.', 'res_blocks.0.norm2.')
+                new_k = new_k.replace('net.8.', 'out_conv.')
+                mapped_dict[new_k] = v
+            return super().load_state_dict(mapped_dict, strict=False)
+        return super().load_state_dict(state_dict, strict=strict)
     
     def forward(self, fno_pred: torch.Tensor, grid_input: torch.Tensor) -> torch.Tensor:
         """
@@ -98,7 +134,9 @@ class PINN_Refiner(nn.Module):
         
         # Permute to (B, C, nx, ny) for 2D convolution
         x = refiner_input.permute(0, 3, 1, 2)
-        correction = self.net(x).permute(0, 2, 3, 1)  # (B, nx, ny, 4)
+        h = self.in_proj(x)
+        h = self.res_blocks(h)
+        correction = self.out_conv(h).permute(0, 2, 3, 1)  # (B, nx, ny, 4)
         
         # SDF-weighted blending
         sdf = grid_input[..., 4:5]  # (B, nx, ny, 1)
@@ -112,7 +150,9 @@ class PINN_Refiner(nn.Module):
         """Return only the correction field (for diagnostics)."""
         refiner_input = torch.cat([grid_input, fno_pred], dim=-1)
         x = refiner_input.permute(0, 3, 1, 2)
-        return self.net(x).permute(0, 2, 3, 1)
+        h = self.in_proj(x)
+        h = self.res_blocks(h)
+        return self.out_conv(h).permute(0, 2, 3, 1)
 
 
 class IterativeRefiner:

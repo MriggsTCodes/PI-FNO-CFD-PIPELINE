@@ -13,8 +13,8 @@ tmux kill-session -t pifno_refiner 2>/dev/null || true
 echo "Starting extended PINN Refiner training + evaluation..."
 echo "Timestamp: $(date)" > "$LOG_FILE"
 
-# Start refiner inside a persistent detached tmux session (train_ref -> evaluate)
-tmux new-session -d -s pifno_refiner "cd $PROJECT_DIR && source $VENV/bin/activate && python -u run_pipeline.py --stage train_ref --epochs 1000 2>&1 | tee -a '$LOG_FILE' && python -u run_pipeline.py --stage evaluate 2>&1 | tee -a '$LOG_FILE'; echo '=== Refiner Run & Evaluation Completed ===' >> '$LOG_FILE'"
+# Start refiner inside a persistent detached tmux session (train_ref -> evaluate -> cross_validate)
+tmux new-session -d -s pifno_refiner "cd $PROJECT_DIR && source $VENV/bin/activate && python -u run_pipeline.py --stage train_ref --epochs 600 2>&1 | tee -a '$LOG_FILE' && python -u run_pipeline.py --stage evaluate 2>&1 | tee -a '$LOG_FILE' && python -u evaluation/cross_validate.py 2>&1 | tee -a '$LOG_FILE'; echo '=== Refiner Run, Evaluation & Statistical CV Completed ===' >> '$LOG_FILE'"
 
 TMUX_PID=$(tmux list-panes -t pifno_refiner -F "#{pane_pid}")
 echo "$TMUX_PID" > "$PID_FILE"

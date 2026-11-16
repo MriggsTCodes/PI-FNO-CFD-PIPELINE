@@ -49,7 +49,7 @@ PR = 4.834                         # Prandtl number
 BETA = 3.4e-04                     # Thermal expansion coefficient [1/K]
 T_REF = 308.15                     # Reference temperature [K]
 T_WALL = 293.15                    # Wall temperature [K]
-G = 9.81                           # Gravitational acceleration [m/s^2]
+G = 0.0                            # Gravitational acceleration [m/s^2] (OpenFOAM constant/g is (0,0,0) - forced convection)
 ALPHA_THERMAL = NU / PR            # Thermal diffusivity [m^2/s]
 
 # ──────────────────────────────────────────────────────────
@@ -92,9 +92,11 @@ REFINER_LR = 1e-4                  # Stable LR for convolutional refiner
 REFINER_WEIGHT_DECAY = 1e-5
 REFINER_PATIENCE = 300
 REFINER_SCHEDULER_PATIENCE = 100
-REFINER_PHYSICS_WEIGHT = 0.01      # Balanced physics regularization
+REFINER_PHYSICS_WEIGHT = 0.02      # Balanced physics regularization
 REFINER_BOUNDARY_WEIGHT = 0.05     # Boundary enforcement weight
+REFINER_CYCLIC_WEIGHT = 1.0        # Cyclic boundary condition enforcement weight
 REFINER_DATA_WEIGHT = 1.0          # Supervised residual correction weight (primary loss)
+AUGMENT_CIRCULAR_SHIFTS = 4        # Physics-preserving cyclic shifts along x (1x, 4x augmentation)
 
 # ──────────────────────────────────────────────────────────
 # SDF Blending

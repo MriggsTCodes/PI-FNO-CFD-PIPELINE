@@ -27,13 +27,13 @@ from config import (
     REFINER_HIDDEN, REFINER_LAYERS, REFINER_EPOCHS,
     REFINER_LR, REFINER_WEIGHT_DECAY,
     REFINER_PATIENCE, REFINER_SCHEDULER_PATIENCE,
-    REFINER_PHYSICS_WEIGHT, REFINER_BOUNDARY_WEIGHT, REFINER_DATA_WEIGHT,
-    TRAIN_RE_MAX
+    REFINER_PHYSICS_WEIGHT, REFINER_BOUNDARY_WEIGHT, REFINER_CYCLIC_WEIGHT, REFINER_DATA_WEIGHT,
+    TRAIN_RE_MAX, AUGMENT_CIRCULAR_SHIFTS
 )
 from models.fno_sr import FNO_SuperResolution
 from models.pinn_refiner import PINN_Refiner
 from data.coarsen import prepare_sr_dataset
-from data.dataset import load_normalization_stats
+from data.dataset import load_normalization_stats, CyclicSRDataset
 from training.losses import refiner_training_loss
 
 
@@ -78,8 +78,10 @@ def train_refiner(sr_model_path: str = None, epochs: int = None):
     # ── 2. Load Data ──
     print("[Stage 2] Loading paired dataset...")
     paired_data = prepare_sr_dataset()
-    train_data = [s for s in paired_data if s['Re'] <= TRAIN_RE_MAX]
-    print(f"[Stage 2] Training on {len(train_data)} samples")
+    train_dataset = CyclicSRDataset(
+        paired_data, split='train', augment=True, n_shifts=AUGMENT_CIRCULAR_SHIFTS
+    )
+    print(f"[Stage 2] Training dataset: {len(train_dataset)} augmented physical samples")
     
     stats = load_normalization_stats()
     mu = stats['mu'].to(DEVICE)
@@ -108,9 +110,11 @@ def train_refiner(sr_model_path: str = None, epochs: int = None):
     
     print(f"\n[Stage 2] Training Configuration:")
     print(f"  Epochs: {total_epochs}")
-    print(f"  Physics Weight: {REFINER_PHYSICS_WEIGHT}")
+    print(f"  Physics Weight (base): {REFINER_PHYSICS_WEIGHT}")
     print(f"  Boundary Weight: {REFINER_BOUNDARY_WEIGHT}")
+    print(f"  Cyclic Weight: {REFINER_CYCLIC_WEIGHT}")
     print(f"  Data Weight: {REFINER_DATA_WEIGHT}")
+    print(f"  Augmentation: {AUGMENT_CIRCULAR_SHIFTS}x circular shifts")
     
     # ── 5. Training Loop ──
     best_loss = float('inf')
@@ -123,14 +127,17 @@ def train_refiner(sr_model_path: str = None, epochs: int = None):
         total_data = 0.0
         total_phys = 0.0
         total_bound = 0.0
+        total_cyclic = 0.0
         total_improvement = 0.0
         
-        for sample in train_data:
+        # Annealed physics curriculum: gently ramp physics regularization as data loss settles
+        curr_phys_weight = min(0.05, REFINER_PHYSICS_WEIGHT * (1.0 + 2.0 * (epoch / max(1, total_epochs))))
+        
+        for idx in range(len(train_dataset)):
+            sample = train_dataset[idx]
             coarse_grid = sample['coarse_grid'].unsqueeze(0).to(DEVICE)
-            fine_grid = sample['fine_grid'].unsqueeze(0).to(DEVICE)
-            
-            fine_input = fine_grid[..., 0:5]
-            fine_target = fine_grid[..., 5:9]
+            fine_input = sample['fine_input'].unsqueeze(0).to(DEVICE)
+            fine_target = sample['fine_target'].unsqueeze(0).to(DEVICE)
             
             # Get frozen SR-FNO prediction
             with torch.no_grad():
@@ -145,8 +152,9 @@ def train_refiner(sr_model_path: str = None, epochs: int = None):
             losses = refiner_training_loss(
                 refined_pred, sr_pred.detach(), fine_target, fine_input,
                 mu_targets, sigma_targets,
-                physics_weight=REFINER_PHYSICS_WEIGHT,
+                physics_weight=curr_phys_weight,
                 boundary_weight=REFINER_BOUNDARY_WEIGHT,
+                cyclic_weight=REFINER_CYCLIC_WEIGHT,
                 data_weight=REFINER_DATA_WEIGHT
             )
             
@@ -157,17 +165,20 @@ def train_refiner(sr_model_path: str = None, epochs: int = None):
             total_data += losses['data'].item()
             total_phys += losses['physics'].item()
             total_bound += losses['boundary'].item()
+            total_cyclic += losses['cyclic'].item()
             total_improvement += losses['improvement'].item()
         
-        n = len(train_data)
+        n = len(train_dataset)
         avg_data = total_data / n
         avg_phys = total_phys / n
         avg_bound = total_bound / n
+        avg_cyclic = total_cyclic / n
         avg_improvement = total_improvement / n
         
         combined = (REFINER_DATA_WEIGHT * avg_data +
-                    REFINER_PHYSICS_WEIGHT * avg_phys +
-                    REFINER_BOUNDARY_WEIGHT * avg_bound)
+                    curr_phys_weight * avg_phys +
+                    REFINER_BOUNDARY_WEIGHT * avg_bound +
+                    REFINER_CYCLIC_WEIGHT * avg_cyclic)
         
         scheduler.step(combined)
         
@@ -186,7 +197,7 @@ def train_refiner(sr_model_path: str = None, epochs: int = None):
             lr = optimizer.param_groups[0]['lr']
             imp_pct = avg_improvement * 100
             print(f"Epoch {epoch:5d} | Data: {avg_data:.4e} | Phys: {avg_phys:.4e} | "
-                  f"Bound: {avg_bound:.4e} | Improve: {imp_pct:+.2f}% | LR: {lr:.2e}", flush=True)
+                  f"Bound: {avg_bound:.4e} | Cyclic: {avg_cyclic:.4e} | Improve: {imp_pct:+.2f}% | LR: {lr:.2e}", flush=True)
     
     # ── 6. Save Model ──
     timestamp = datetime.datetime.now().strftime("%b-%d_%I-%M-%p")

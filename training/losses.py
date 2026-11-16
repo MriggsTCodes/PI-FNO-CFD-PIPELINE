@@ -65,8 +65,9 @@ def sr_training_loss(sr_pred: torch.Tensor, fine_target: torch.Tensor,
 def refiner_training_loss(refined_pred: torch.Tensor, sr_pred: torch.Tensor,
                           fine_target: torch.Tensor, fine_input: torch.Tensor,
                           mu_targets: torch.Tensor, sigma_targets: torch.Tensor,
-                          physics_weight: float = 0.01,
+                          physics_weight: float = 0.02,
                           boundary_weight: float = 0.05,
+                          cyclic_weight: float = 1.0,
                           data_weight: float = 1.0) -> dict:
     """
     Combined loss for training the PINN refiner.
@@ -75,21 +76,8 @@ def refiner_training_loss(refined_pred: torch.Tensor, sr_pred: torch.Tensor,
       1. Match the ground truth (data loss)
       2. Minimize PDE residuals (physics loss)
       3. Enforce wall BCs (boundary loss)
-      4. Improve upon the FNO baseline (correction should reduce error)
-    
-    Args:
-        refined_pred: (B, fine_nx, fine_ny, 4) — Refined output (normalized)
-        sr_pred:      (B, fine_nx, fine_ny, 4) — FNO SR output (normalized, detached)
-        fine_target:  (B, fine_nx, fine_ny, 4) — Ground truth (normalized)
-        fine_input:   (B, fine_nx, fine_ny, 5) — Fine grid coordinates
-        mu_targets:   (4,) — Target channel means
-        sigma_targets:(4,) — Target channel stds
-        physics_weight: Weight for PDE residual loss
-        boundary_weight: Weight for wall BC loss
-        data_weight: Weight for supervised data loss
-        
-    Returns:
-        dict with 'total', 'data', 'physics', 'boundary', 'improvement' losses
+      4. Strictly enforce cyclic periodicity (inlet-outlet matching)
+      5. Improve upon the FNO baseline (correction should reduce error)
     """
     # Data loss
     loss_data = F.mse_loss(refined_pred, fine_target)
@@ -103,13 +91,17 @@ def refiner_training_loss(refined_pred: torch.Tensor, sr_pred: torch.Tensor,
     
     # Wall velocity enforcement (no-slip)
     loss_wall_vel = wall_velocity_loss(
-        refined_pred * sigma_targets + mu_targets, fine_input
+        preds_phys, fine_input
     )
+    
+    # Cyclic boundary loss (strict inlet/outlet periodicity on normalized fields)
+    loss_cyclic = cyclic_bc_loss(refined_pred)
     
     # Total
     total = (data_weight * loss_data +
              physics_weight * loss_phys +
-             boundary_weight * (loss_boundary + loss_wall_vel))
+             boundary_weight * (loss_boundary + loss_wall_vel) +
+             cyclic_weight * loss_cyclic)
     
     # Diagnostic: did the refiner improve over the FNO baseline?
     sr_error = F.mse_loss(sr_pred, fine_target).detach()
@@ -122,5 +114,6 @@ def refiner_training_loss(refined_pred: torch.Tensor, sr_pred: torch.Tensor,
         'physics': loss_phys,
         'boundary': loss_boundary,
         'wall_velocity': loss_wall_vel,
+        'cyclic': loss_cyclic,
         'improvement': improvement,
     }

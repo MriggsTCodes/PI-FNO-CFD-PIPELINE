@@ -141,11 +141,15 @@ def evaluate_pipeline(run_folder: str = None):
             else:
                 refined_pred = sr_pred
         
-        # Also compute bilinear-upsampled coarse baseline
+        # Also compute bilinear and bicubic upsampled coarse baselines
         coarse_fields = coarse_grid[..., 5:9].permute(0, 3, 1, 2)
         bilinear_up = F.interpolate(
             coarse_fields, size=(FINE_NX, FINE_NY),
             mode='bilinear', align_corners=True
+        ).permute(0, 2, 3, 1)
+        bicubic_up = F.interpolate(
+            coarse_fields, size=(FINE_NX, FINE_NY),
+            mode='bicubic', align_corners=True
         ).permute(0, 2, 3, 1)
         
         # Convert to numpy (de-normalize)
@@ -153,6 +157,7 @@ def evaluate_pipeline(run_folder: str = None):
         sr_np = sr_pred.squeeze(0).cpu().numpy() * sigma_targets + mu_targets
         refined_np = refined_pred.squeeze(0).cpu().numpy() * sigma_targets + mu_targets
         bilinear_np = bilinear_up.squeeze(0).cpu().numpy() * sigma_targets + mu_targets
+        bicubic_np = bicubic_up.squeeze(0).cpu().numpy() * sigma_targets + mu_targets
         
         inputs_np = fine_input.squeeze(0).cpu().numpy()
         gx = inputs_np[..., 0]
@@ -165,46 +170,44 @@ def evaluate_pipeline(run_folder: str = None):
         
         # ── Quantitative Metrics ──
         case_report = []
-        case_report.append(f"\n{'─' * 135}")
+        case_report.append(f"\n{'─' * 145}")
         case_report.append(f"  Case: {geom.upper()} | Re = {re_val} | "
                           f"Coarse: {COARSE_NX}×{COARSE_NY} → Fine: {FINE_NX}×{FINE_NY}")
-        case_report.append(f"{'─' * 135}")
-        case_report.append(f"{'Field':<16} | {'Fluid Bilinear':>14} | {'Fluid SR-FNO':>13} | "
-                          f"{'Fluid Refined':>13} | {'Mesh SR L2':>11} | {'Wall SR L2':>11} | {'Speedup':>8}")
-        case_report.append("─" * 135)
+        case_report.append(f"{'─' * 145}")
+        case_report.append(f"{'Field':<16} | {'Bilinear L2':>12} | {'Bicubic L2':>11} | {'SR-FNO L2':>11} | "
+                          f"{'Refined L2':>11} | {'Ref MAE':>14} | {'Ref MaxErr':>14} | {'Gain':>6}")
+        case_report.append("─" * 145)
         
         for i in range(4):
             true_f = targets_np[..., i]
             sr_f = sr_np[..., i]
             ref_f = refined_np[..., i]
             bil_f = bilinear_np[..., i]
+            bic_f = bicubic_np[..., i]
             
             # Fluid-only metrics (true physical domain)
             true_fluid = true_f[is_fluid]
             sr_fluid = sr_f[is_fluid]
             ref_fluid = ref_f[is_fluid]
             bil_fluid = bil_f[is_fluid]
+            bic_fluid = bic_f[is_fluid]
             norm_fluid = np.linalg.norm(true_fluid) + 1e-8
             
             l2_bilinear_fluid = np.linalg.norm(bil_fluid - true_fluid) / norm_fluid
+            l2_bicubic_fluid = np.linalg.norm(bic_fluid - true_fluid) / norm_fluid
             l2_sr_fluid = np.linalg.norm(sr_fluid - true_fluid) / norm_fluid
             l2_refined_fluid = np.linalg.norm(ref_fluid - true_fluid) / norm_fluid
             
-            # Full mesh metrics
-            norm_mesh = np.linalg.norm(true_f) + 1e-8
-            l2_sr_mesh = np.linalg.norm(sr_f - true_f) / norm_mesh
+            # Absolute physical error metrics
+            mae_ref = np.mean(np.abs(ref_fluid - true_fluid))
+            max_ref = np.max(np.abs(ref_fluid - true_fluid))
             
-            # Wall layer metrics
-            true_wall = true_f[is_wall]
-            l2_sr_wall = np.linalg.norm(sr_f[is_wall] - true_wall) / (np.linalg.norm(true_wall) + 1e-8)
-            l2_ref_wall = np.linalg.norm(ref_f[is_wall] - true_wall) / (np.linalg.norm(true_wall) + 1e-8)
-            
-            speedup = l2_bilinear_fluid / (l2_refined_fluid + 1e-8)
+            gain = l2_bilinear_fluid / (l2_refined_fluid + 1e-8)
             
             case_report.append(
-                f"{FIELDS[i]:<16} | {l2_bilinear_fluid*100:13.2f}% | {l2_sr_fluid*100:12.2f}% | "
-                f"{l2_refined_fluid*100:12.2f}% | {l2_sr_mesh*100:10.2f}% | "
-                f"{l2_sr_wall*100:10.2f}% | {speedup:7.1f}x"
+                f"{FIELDS[i]:<16} | {l2_bilinear_fluid*100:11.2f}% | {l2_bicubic_fluid*100:10.2f}% | "
+                f"{l2_sr_fluid*100:10.2f}% | {l2_refined_fluid*100:10.2f}% | "
+                f"{mae_ref:11.3e} {UNITS[i]:<2} | {max_ref:11.3e} {UNITS[i]:<2} | {gain:5.1f}x"
             )
         
         # Physical benchmarks inside fluid
@@ -226,9 +229,13 @@ def evaluate_pipeline(run_folder: str = None):
         Tb_pred = np.sum(u_pred * T_pred, axis=1) / (np.sum(u_pred, axis=1) + 1e-8)
         Tb_true = np.sum(u_true * T_true, axis=1) / (np.sum(u_true, axis=1) + 1e-8)
         
+        p_std = np.std(p_true[is_fluid])
+        dp_ratio = abs(dp_pred) / (p_std + 1e-8) * 100
+        Tb_dev = abs(np.mean(Tb_pred) - np.mean(Tb_true))
+        
         case_report.append(f"\n  Physical Benchmarks (Fluid Domain):")
-        case_report.append(f"    Cyclic ΔP residual (inlet-outlet): Pred = {dp_pred:.5e} | True = {dp_true:.5e} m²/s²")
-        case_report.append(f"    T_bulk (mixed-mean):             Pred = {np.mean(Tb_pred):.2f} K | True = {np.mean(Tb_true):.2f} K")
+        case_report.append(f"    Cyclic ΔP residual (inlet-outlet): Pred = {dp_pred:.5e} | True = {dp_true:.5e} m²/s² ({dp_ratio:.2f}% of σ_p)")
+        case_report.append(f"    T_bulk (mixed-mean):             Pred = {np.mean(Tb_pred):.2f} K | True = {np.mean(Tb_true):.2f} K (Dev = {Tb_dev:.3f} K)")
         
         print("\n".join(case_report))
         report.extend(case_report)

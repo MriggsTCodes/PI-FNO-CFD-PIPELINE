@@ -148,7 +148,7 @@ def physics_loss(preds: torch.Tensor, inputs: torch.Tensor,
     
     loss_pde = (
         10.0 * f_u_term +
-        1.0 * f_v_term +
+        10.0 * f_v_term +
         0.1 * f_mass_term +
         0.001 * f_T_term
     )
