@@ -79,7 +79,7 @@ def train_refiner(sr_model_path: str = None, epochs: int = None):
     print("[Stage 2] Loading paired dataset...")
     paired_data = prepare_sr_dataset()
     train_dataset = CyclicSRDataset(
-        paired_data, split='train', augment=True, n_shifts=AUGMENT_CIRCULAR_SHIFTS
+        paired_data, split='train', augment=False, n_shifts=1
     )
     print(f"[Stage 2] Training dataset: {len(train_dataset)} augmented physical samples")
     
