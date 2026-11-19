@@ -2,13 +2,17 @@
 Navier-Stokes Residual Computation
 ===================================
 Computes PDE residuals using finite differences on structured grids.
-Supports the full incompressible Boussinesq Navier-Stokes + Energy system.
+Supports the full incompressible forced-convection Navier-Stokes + Energy system.
 
-Governing Equations (dimensional):
+Governing Equations (dimensional, forced convection with g=0):
   Continuity:  ∂u/∂x + ∂v/∂y = 0
   X-Momentum:  u·∂u/∂x + v·∂u/∂y = -∂p/∂x + ν(∂²u/∂x² + ∂²u/∂y²)
-  Y-Momentum:  u·∂v/∂x + v·∂v/∂y = -∂p/∂y + ν(∂²v/∂x² + ∂²v/∂y²) + gβ(T - T_ref)
+  Y-Momentum:  u·∂v/∂x + v·∂v/∂y = -∂p/∂y + ν(∂²v/∂x² + ∂²v/∂y²)
   Energy:      u·∂T/∂x + v·∂T/∂y = α(∂²T/∂x² + ∂²T/∂y²)
+
+v3 Improvements:
+  - Smooth SDF-based stencil confidence weighting near walls instead of hard binary cutoff
+  - Prevents artificial gradient spikes from stencil points crossing the fluid-solid interface
 """
 
 import torch
@@ -35,6 +39,33 @@ def grid_gradient(f: torch.Tensor, dx: float, dy: float):
     """
     df_dx, df_dy = torch.gradient(f, spacing=(dx, dy), dim=(1, 2))
     return df_dx, df_dy
+
+
+def compute_stencil_confidence(sdf: torch.Tensor, threshold: float = 0.02,
+                                transition_width: float = 0.03) -> torch.Tensor:
+    """
+    Compute smooth stencil confidence weight based on SDF.
+    
+    Instead of a hard binary mask (SDF > threshold), this returns a smooth
+    sigmoid weight that transitions from 0 (near wall) to 1 (deep interior).
+    This prevents derivative stencil points near the wall interface from
+    contributing large spurious residuals.
+    
+    For second derivatives (which use 3-point stencils), a cell at SDF=0.02
+    still has stencil neighbours at SDF ≈ 0 (the wall). The smooth weight
+    gracefully fades these cells' contributions rather than abruptly including
+    or excluding them.
+    
+    Args:
+        sdf: Signed distance field (batch, nx, ny)
+        threshold: Center of the sigmoid transition
+        transition_width: Width parameter (larger = smoother)
+    
+    Returns:
+        weight: Smooth confidence weight in [0, 1], same shape as sdf
+    """
+    # sigmoid centered at threshold, with steepness controlled by transition_width
+    return torch.sigmoid((sdf - threshold) / transition_width)
 
 
 def navier_stokes_residuals(preds: torch.Tensor, inputs: torch.Tensor,
@@ -86,7 +117,7 @@ def navier_stokes_residuals(preds: torch.Tensor, inputs: torch.Tensor,
     
     alpha = nu / Pr
     
-    # PDE Residuals
+    # PDE Residuals (forced convection: g=0, no buoyancy)
     f_u = u * u_x + v * u_y + p_x - nu * (u_xx + u_yy)
     f_v = u * v_x + v * v_y + p_y - nu * (v_xx + v_yy) - g * beta * (T - T_ref)
     f_mass = u_x + v_y
@@ -113,13 +144,16 @@ def physics_loss(preds: torch.Tensor, inputs: torch.Tensor,
     """
     Scalar physics loss: Balanced MSE of all PDE residuals + cyclic BCs.
     
-    Residuals are evaluated strictly on fluid interior cells (away from wall interface)
-    to prevent spurious boundary finite-difference artifacts.
+    Uses smooth SDF-based stencil confidence weighting instead of a hard
+    binary mask. Cells near the wall interface receive lower weight, preventing
+    fictitious gradient spikes from finite-difference stencils crossing the
+    curved fluid-solid boundary.
+    
     Terms are balanced so momentum, continuity, and energy contribute harmoniously:
-      - 10.0  * f_u^2
-      - 1.0   * f_v^2
-      - 0.1   * f_mass^2
-      - 0.001 * f_T^2
+      - 10.0  * f_u^2  (streamwise momentum)
+      - 10.0  * f_v^2  (wall-normal momentum)
+      - 0.1   * f_mass^2 (continuity)
+      - 0.001 * f_T^2  (energy)
     
     Args:
         preds:  (batch, nx, ny, 4) — [u, v, p, T] in physical units
@@ -131,20 +165,22 @@ def physics_loss(preds: torch.Tensor, inputs: torch.Tensor,
     """
     residuals = navier_stokes_residuals(preds, inputs, **kwargs)
     
-    # Identify fluid domain: use SDF if mask is not explicitly provided
+    # Smooth stencil confidence weighting
     if mask is None:
         sdf = inputs[..., 4]  # Normalized distance to wall
-        # Fluid interior: cells away from the immediate wall interface (SDF > 0.02)
-        fluid_interior = (sdf > 0.02).float()
+        # Smooth confidence: sigmoid transition from 0 (at wall) to 1 (deep interior)
+        # threshold=0.03 ensures stencil cells with any neighbour in solid get low weight
+        # transition_width=0.02 gives a smooth ~4-cell transition zone
+        stencil_weight = compute_stencil_confidence(sdf, threshold=0.03, transition_width=0.02)
     else:
-        fluid_interior = mask.float()
+        stencil_weight = mask.float()
     
-    n_fluid = fluid_interior.sum().clamp(min=1.0)
+    n_effective = stencil_weight.sum().clamp(min=1.0)
     
-    f_u_term = torch.sum((residuals['f_u'] ** 2) * fluid_interior) / n_fluid
-    f_v_term = torch.sum((residuals['f_v'] ** 2) * fluid_interior) / n_fluid
-    f_mass_term = torch.sum((residuals['f_mass'] ** 2) * fluid_interior) / n_fluid
-    f_T_term = torch.sum((residuals['f_T'] ** 2) * fluid_interior) / n_fluid
+    f_u_term = torch.sum((residuals['f_u'] ** 2) * stencil_weight) / n_effective
+    f_v_term = torch.sum((residuals['f_v'] ** 2) * stencil_weight) / n_effective
+    f_mass_term = torch.sum((residuals['f_mass'] ** 2) * stencil_weight) / n_effective
+    f_T_term = torch.sum((residuals['f_T'] ** 2) * stencil_weight) / n_effective
     
     loss_pde = (
         10.0 * f_u_term +

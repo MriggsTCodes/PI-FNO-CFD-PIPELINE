@@ -27,7 +27,8 @@ from config import (
     SR_MODES, SR_WIDTH,
     REFINER_HIDDEN, REFINER_LAYERS,
     FINE_NX, FINE_NY, COARSE_NX, COARSE_NY,
-    TEST_RE, L, H_MIN, H_MAX, AMPLITUDE
+    TEST_RE, L, H_MIN, H_MAX, AMPLITUDE,
+    T_REF, T_WALL
 )
 from models.fno_sr import FNO_SuperResolution
 from models.pinn_refiner import PINN_Refiner
@@ -170,13 +171,16 @@ def evaluate_pipeline(run_folder: str = None):
         
         # ── Quantitative Metrics ──
         case_report = []
-        case_report.append(f"\n{'─' * 145}")
+        case_report.append(f"\n{'─' * 165}")
         case_report.append(f"  Case: {geom.upper()} | Re = {re_val} | "
                           f"Coarse: {COARSE_NX}×{COARSE_NY} → Fine: {FINE_NX}×{FINE_NY}")
-        case_report.append(f"{'─' * 145}")
+        case_report.append(f"{'─' * 165}")
         case_report.append(f"{'Field':<16} | {'Bilinear L2':>12} | {'Bicubic L2':>11} | {'SR-FNO L2':>11} | "
-                          f"{'Refined L2':>11} | {'Ref MAE':>14} | {'Ref MaxErr':>14} | {'Gain':>6}")
-        case_report.append("─" * 145)
+                          f"{'Refined L2':>11} | {'Ref MAE':>14} | {'Ref MaxErr':>14} | {'Norm MAE/Ub':>12} | {'Gain':>6}")
+        case_report.append("─" * 165)
+        
+        # Compute bulk velocity for normalization (robust metric for near-zero fields)
+        u_bulk = np.mean(np.abs(targets_np[..., 0][is_fluid]))
         
         for i in range(4):
             true_f = targets_np[..., i]
@@ -202,12 +206,23 @@ def evaluate_pipeline(run_folder: str = None):
             mae_ref = np.mean(np.abs(ref_fluid - true_fluid))
             max_ref = np.max(np.abs(ref_fluid - true_fluid))
             
+            # Bulk-velocity-normalized MAE (robust for near-zero fields like v in flat channels)
+            # For velocities: normalize by U_bulk; for pressure: by U_bulk^2; for T: by ΔT
+            if i < 2:  # velocities
+                norm_scale = u_bulk + 1e-8
+            elif i == 2:  # pressure (kinematic p ~ u^2)
+                norm_scale = u_bulk**2 + 1e-8
+            else:  # temperature
+                norm_scale = abs(T_REF - T_WALL) + 1e-8
+            mae_normalized = mae_ref / norm_scale * 100  # percentage of reference scale
+            
             gain = l2_bilinear_fluid / (l2_refined_fluid + 1e-8)
             
             case_report.append(
                 f"{FIELDS[i]:<16} | {l2_bilinear_fluid*100:11.2f}% | {l2_bicubic_fluid*100:10.2f}% | "
                 f"{l2_sr_fluid*100:10.2f}% | {l2_refined_fluid*100:10.2f}% | "
-                f"{mae_ref:11.3e} {UNITS[i]:<2} | {max_ref:11.3e} {UNITS[i]:<2} | {gain:5.1f}x"
+                f"{mae_ref:11.3e} {UNITS[i]:<2} | {max_ref:11.3e} {UNITS[i]:<2} | "
+                f"{mae_normalized:10.4f}%  | {gain:5.1f}x"
             )
         
         # Physical benchmarks inside fluid

@@ -1,18 +1,19 @@
 """
-PINN Physics Refiner
-====================
+PINN Physics Refiner — Multi-Scale U-Net Architecture
+======================================================
 Post-processor that takes the FNO super-resolution output and
 applies physics-based corrections using PDE residual minimization.
 
-Two modes of operation:
-  1. Learned Refiner (training): MLP predicts a correction field that
-     is added to the FNO output. Trained with physics + data loss.
-  2. Iterative Refiner (inference): Gradient-based optimization of the
-     solution to minimize PDE residuals (no learned parameters needed).
+Architecture v3: Multi-Scale Cyclic U-Net
+  - Encoder path with downsampling (128×64 → 64×32 → 32×16) for global context
+  - Bottleneck at 32×16 gives full-domain receptive field for elliptic pressure
+  - Decoder path with skip connections for preserving fine-scale detail
+  - All convolutions use cyclic x-padding and replicate y-padding
+  - Zero-initialized output projection for identity-start training
 
-The Learned Refiner uses SDF-weighted blending: stronger corrections
-near walls (where FNO struggles) and minimal corrections in the interior
-(where FNO is already accurate).
+This design directly addresses the elliptic pressure bottleneck:
+the previous flat CyclicResBlock had a 9×9 receptive field, insufficient
+for propagating global pressure information governed by the Poisson equation.
 """
 
 import torch
@@ -27,6 +28,8 @@ from config import SDF_BLEND_SHARPNESS, N_INPUT_CHANNELS, N_OUTPUT_CHANNELS
 
 def pad_channel(x: torch.Tensor, pad: int = 1) -> torch.Tensor:
     """Circular padding along x (dim 2), replicate padding along y (dim 3)."""
+    if pad <= 0:
+        return x
     x = torch.cat([x[:, :, -pad:, :], x, x[:, :, :pad, :]], dim=2)
     x = F.pad(x, [pad, pad, 0, 0], mode='replicate')
     return x
@@ -61,61 +64,117 @@ class CyclicResBlock(nn.Module):
         return self.act2(out + res)
 
 
+class CyclicDownBlock(nn.Module):
+    """Encoder block: CyclicResBlock at input resolution, then downsample.
+    
+    Returns (downsampled_output, skip_connection).
+    The skip connection is at the INPUT channel width (before projection),
+    so the decoder knows exactly what channel count to expect.
+    """
+    def __init__(self, in_ch: int, out_ch: int):
+        super().__init__()
+        self.res = CyclicResBlock(in_ch)
+        # Channel projection applied AFTER skip tap
+        self.proj = CyclicConv2d(in_ch, out_ch, kernel_size=1) if in_ch != out_ch else nn.Identity()
+        self.norm = nn.GroupNorm(4, out_ch) if in_ch != out_ch else nn.Identity()
+        # Downsample: average pool 2×2 (preserves cyclic structure)
+        self.down = nn.AvgPool2d(kernel_size=2, stride=2)
+        self.skip_ch = in_ch  # expose for decoder construction
+    
+    def forward(self, x: torch.Tensor):
+        h = self.res(x)
+        skip = h                        # skip at in_ch channels
+        h = self.norm(self.proj(h))     # project to out_ch
+        return self.down(h), skip       # return (downsampled at out_ch, skip at in_ch)
+
+
+class CyclicUpBlock(nn.Module):
+    """Decoder block: upsample + concat skip + CyclicResBlock."""
+    def __init__(self, in_ch: int, skip_ch: int, out_ch: int):
+        super().__init__()
+        self.up_proj = CyclicConv2d(in_ch, out_ch, kernel_size=1)
+        self.up_norm = nn.GroupNorm(4, out_ch)
+        self.res = CyclicResBlock(out_ch + skip_ch)
+        # Project merged channels back to out_ch
+        self.merge_proj = CyclicConv2d(out_ch + skip_ch, out_ch, kernel_size=1)
+        self.merge_norm = nn.GroupNorm(4, out_ch)
+    
+    def forward(self, x: torch.Tensor, skip: torch.Tensor):
+        # Upsample via bilinear interpolation (resolution-independent)
+        h = F.interpolate(x, size=skip.shape[2:], mode='bilinear', align_corners=True)
+        h = self.up_norm(self.up_proj(h))
+        # Concatenate skip connection
+        h = torch.cat([h, skip], dim=1)
+        h = self.res(h)
+        h = self.merge_norm(self.merge_proj(h))
+        return h
+
+
 class PINN_Refiner(nn.Module):
     """
-    Learned physics-informed correction network.
+    Multi-Scale Cyclic U-Net Physics Refiner.
     
-    Takes the FNO super-resolution output + grid metadata as input,
-    and outputs a residual correction Δ(u, v, p, T) that is added
-    to the FNO prediction.
+    Addresses the elliptic pressure bottleneck by providing a global
+    receptive field through encoder-decoder architecture with skip
+    connections, while maintaining exact cyclic periodicity via
+    CyclicConv2d padding.
     
-    Uses 2D cyclic residual convolutions to preserve spatial gradients and
-    channel periodicity, avoiding checkerboard artifacts of pointwise MLPs.
+    Encoder path: 128×64 → 64×32 → 32×16 (global context for pressure)
+    Bottleneck:   32×16 with 2× CyclicResBlock (full-domain view)
+    Decoder path: 32×16 → 64×32 → 128×64 (reconstruct fine corrections)
     
     Args:
         in_features: Number of input channels (5 coords + 4 fields = 9)
-        hidden_features: Channel width of convolutional layers
+        hidden_features: Base channel width (scales 1×, 2×, 4× through encoder)
         out_features: Number of output correction channels (4)
-        num_layers: Depth of convolutional network
+        num_layers: Ignored for backward compat; architecture is fixed U-Net
     """
     
     def __init__(self, in_features: int = 9, hidden_features: int = 64,
                  out_features: int = 4, num_layers: int = 4):
         super().__init__()
         
+        C = hidden_features  # Base channels: 64
+        
+        # ── Input projection ──
         self.in_proj = nn.Sequential(
-            CyclicConv2d(in_features, hidden_features, kernel_size=3),
-            nn.GroupNorm(4, hidden_features),
+            CyclicConv2d(in_features, C, kernel_size=3),
+            nn.GroupNorm(4, C),
             nn.GELU()
         )
         
-        # Stack of residual blocks
-        n_blocks = max(1, (num_layers - 2) // 2)
-        blocks = [CyclicResBlock(hidden_features) for _ in range(n_blocks)]
-        self.res_blocks = nn.Sequential(*blocks)
+        # ── Encoder (downsampling) path ──
+        self.enc1 = CyclicDownBlock(C, C)          # 128×64 → 64×32, skip @ C channels
+        self.enc2 = CyclicDownBlock(C, 2 * C)      # 64×32 → 32×16,  skip @ C channels
         
-        self.out_conv = CyclicConv2d(hidden_features, out_features, kernel_size=3)
-        # Initialize final layer to zero (start with exactly zero correction)
+        # ── Bottleneck at 32×16 (global receptive field for pressure) ──
+        self.bottleneck = nn.Sequential(
+            CyclicResBlock(2 * C),
+            CyclicResBlock(2 * C),
+        )
+        
+        # ── Decoder (upsampling) path ──
+        # skip channels match enc's INPUT channels (before projection)
+        self.dec2 = CyclicUpBlock(2 * C, C, C)     # 32×16 → 64×32  (skip2 has C ch)
+        self.dec1 = CyclicUpBlock(C, C, C)          # 64×32 → 128×64 (skip1 has C ch)
+        
+        # ── Output projection (zero-initialized) ──
+        self.out_conv = CyclicConv2d(C, out_features, kernel_size=3)
         nn.init.zeros_(self.out_conv.conv.weight)
         nn.init.zeros_(self.out_conv.conv.bias)
     
     def load_state_dict(self, state_dict, strict=False):
-        """Robust state_dict loader that supports both legacy sequential and residual checkpoints."""
-        is_legacy = any(k.startswith('net.') for k in state_dict.keys())
-        is_current_res = hasattr(self, 'in_proj')
+        """Robust state_dict loader that supports legacy checkpoints."""
+        # Check if this is a legacy flat-network checkpoint
+        is_legacy_flat = any(k.startswith('net.') for k in state_dict.keys())
+        is_legacy_res = (any(k.startswith('in_proj.') for k in state_dict.keys()) and
+                         not any(k.startswith('enc1.') for k in state_dict.keys()))
         
-        if is_legacy and is_current_res:
-            mapped_dict = {}
-            for k, v in state_dict.items():
-                new_k = k
-                new_k = new_k.replace('net.0.', 'in_proj.0.')
-                new_k = new_k.replace('net.2.', 'res_blocks.0.conv1.')
-                new_k = new_k.replace('net.3.', 'res_blocks.0.norm1.')
-                new_k = new_k.replace('net.5.', 'res_blocks.0.conv2.')
-                new_k = new_k.replace('net.6.', 'res_blocks.0.norm2.')
-                new_k = new_k.replace('net.8.', 'out_conv.')
-                mapped_dict[new_k] = v
-            return super().load_state_dict(mapped_dict, strict=False)
+        if is_legacy_flat or is_legacy_res:
+            # Legacy checkpoint incompatible with U-Net; start fresh
+            print("[PINN_Refiner] Legacy checkpoint detected — starting with fresh U-Net weights (zero-init output).")
+            return  # Skip loading; use freshly initialized weights
+        
         return super().load_state_dict(state_dict, strict=strict)
     
     def forward(self, fno_pred: torch.Tensor, grid_input: torch.Tensor) -> torch.Tensor:
@@ -134,9 +193,23 @@ class PINN_Refiner(nn.Module):
         
         # Permute to (B, C, nx, ny) for 2D convolution
         x = refiner_input.permute(0, 3, 1, 2)
+        
+        # Input projection
         h = self.in_proj(x)
-        h = self.res_blocks(h)
-        correction = self.out_conv(h).permute(0, 2, 3, 1)  # (B, nx, ny, 4)
+        
+        # Encoder
+        h1, skip1 = self.enc1(h)       # skip1 @ 128×64, h1 @ 64×32
+        h2, skip2 = self.enc2(h1)      # skip2 @ 64×32,  h2 @ 32×16
+        
+        # Bottleneck (global context)
+        h2 = self.bottleneck(h2)
+        
+        # Decoder
+        d2 = self.dec2(h2, skip2)      # 32×16 → 64×32
+        d1 = self.dec1(d2, skip1)      # 64×32 → 128×64
+        
+        # Output correction
+        correction = self.out_conv(d1).permute(0, 2, 3, 1)  # (B, nx, ny, 4)
         
         # SDF-weighted blending
         sdf = grid_input[..., 4:5]  # (B, nx, ny, 1)
@@ -151,8 +224,12 @@ class PINN_Refiner(nn.Module):
         refiner_input = torch.cat([grid_input, fno_pred], dim=-1)
         x = refiner_input.permute(0, 3, 1, 2)
         h = self.in_proj(x)
-        h = self.res_blocks(h)
-        return self.out_conv(h).permute(0, 2, 3, 1)
+        h1, skip1 = self.enc1(h)
+        h2, skip2 = self.enc2(h1)
+        h2 = self.bottleneck(h2)
+        d2 = self.dec2(h2, skip2)
+        d1 = self.dec1(d2, skip1)
+        return self.out_conv(d1).permute(0, 2, 3, 1)
 
 
 class IterativeRefiner:
