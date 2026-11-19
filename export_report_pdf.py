@@ -17,14 +17,34 @@ def get_base64_image(image_path):
     clean_path = image_path.replace("file:///", "").replace("file://", "")
     if os.name == 'nt':
         clean_path = clean_path.replace("/", "\\")
+    
+    # Try direct path
     if os.path.exists(clean_path):
         with open(clean_path, "rb") as img_file:
             b64_data = base64.b64encode(img_file.read()).decode("utf-8")
             return f"data:image/png;base64,{b64_data}"
+            
+    # Try searching in artifact dir if basename only or relative
+    base_name = os.path.basename(clean_path)
+    artifact_try = os.path.join(ARTIFACT_DIR, base_name)
+    if os.path.exists(artifact_try):
+        with open(artifact_try, "rb") as img_file:
+            b64_data = base64.b64encode(img_file.read()).decode("utf-8")
+            return f"data:image/png;base64,{b64_data}"
+            
+    # Try searching in results dir
+    for root, dirs, files in os.walk(os.path.join(WORKSPACE_DIR, "results")):
+        if base_name in files:
+            full_p = os.path.join(root, base_name)
+            with open(full_p, "rb") as img_file:
+                b64_data = base64.b64encode(img_file.read()).decode("utf-8")
+                return f"data:image/png;base64,{b64_data}"
+                
+    print(f"[Warning] Image not found: {image_path}")
     return image_path
 
 def preprocess_markdown(text):
-    """Process carousels, callouts, and protect LaTeX math."""
+    """Process carousels, standalone images, callouts, and protect LaTeX math."""
     
     # 1. Protect Math blocks from markdown parser mangling
     math_blocks = []
@@ -44,21 +64,24 @@ def preprocess_markdown(text):
     text = re.sub(r'(?<!\$)\$(?!\$)(.+?)(?<!\$)\$(?!\$)', save_inline_math, text)
     
     # 2. Process Carousel blocks -> High-quality Figure Grids
+    fig_counter = 0
     def format_carousel(match):
+        nonlocal fig_counter
         content = match.group(1)
         slides = re.split(r'<!--\s*slide\s*-->', content)
         
         figures_html = ['<div class="figures-gallery">']
-        for i, slide in enumerate(slides):
+        for slide in slides:
             img_match = re.search(r'!\[(.*?)\]\((.*?)\)', slide.strip())
             if img_match:
                 caption = img_match.group(1)
                 img_url = img_match.group(2)
                 b64_src = get_base64_image(img_url)
+                fig_counter += 1
                 figures_html.append(f"""
                 <div class="figure-card">
                     <img src="{b64_src}" alt="{caption}" />
-                    <div class="figure-caption"><strong>Figure {i+1}:</strong> {caption}</div>
+                    <div class="figure-caption"><strong>Figure {fig_counter}:</strong> {caption}</div>
                 </div>
                 """)
         figures_html.append('</div>')
@@ -66,11 +89,26 @@ def preprocess_markdown(text):
 
     text = re.sub(r'````carousel\s*(.*?)\s*````', format_carousel, text, flags=re.DOTALL)
     
-    # 3. Process GitHub-style Alert Callouts (> [!NOTE], > [!WARNING], etc.)
+    # 3. Process standalone markdown images: ![caption](url)
+    def format_standalone_image(match):
+        nonlocal fig_counter
+        caption = match.group(1)
+        img_url = match.group(2)
+        b64_src = get_base64_image(img_url)
+        fig_counter += 1
+        return f"""
+<div class="figure-card">
+    <img src="{b64_src}" alt="{caption}" />
+    <div class="figure-caption"><strong>Figure {fig_counter}:</strong> {caption}</div>
+</div>
+"""
+    # Replace standalone images that aren't inside pre blocks
+    text = re.sub(r'!\[(.*?)\]\((.*?)\)', format_standalone_image, text)
+    
+    # 4. Process GitHub-style Alert Callouts (> [!NOTE], > [!WARNING], etc.)
     def format_callout(match):
         callout_type = match.group(1).lower()
         body = match.group(2).strip()
-        # Clean lines starting with >
         cleaned_body = "\n".join([line.lstrip("> ").strip() for line in body.splitlines()])
         
         icon = "ℹ️"
@@ -95,7 +133,7 @@ def preprocess_markdown(text):
     text = re.sub(r'>\s*\[!(NOTE|WARNING|TIP|IMPORTANT|CAUTION)\]\s*\n((?:>.*(?:\n|$))*)', 
                   format_callout, text, flags=re.IGNORECASE)
     
-    # 4. Clean file:// links for clean print appearance
+    # 5. Clean file:// links for print appearance
     def clean_file_links(match):
         link_text = match.group(1)
         return f'<span class="file-ref"><code>{link_text}</code></span>'
@@ -138,11 +176,11 @@ window.MathJax = {{
 <style>
 @page {{
     size: A4 portrait;
-    margin: 20mm 18mm 22mm 18mm;
+    margin: 18mm 16mm 20mm 16mm;
     @bottom-center {{
         content: counter(page);
         font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
-        font-size: 9pt;
+        font-size: 8.5pt;
         color: #64748b;
     }}
 }}
@@ -153,8 +191,8 @@ window.MathJax = {{
 
 body {{
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-    font-size: 10pt;
-    line-height: 1.6;
+    font-size: 9.5pt;
+    line-height: 1.55;
     color: #1e293b;
     background-color: #ffffff;
     margin: 0 auto;
@@ -165,42 +203,43 @@ h1, h2, h3, h4, h5, h6 {{
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
     color: #0f172a;
     font-weight: 700;
-    margin-top: 1.8em;
-    margin-bottom: 0.6em;
+    margin-top: 1.6em;
+    margin-bottom: 0.5em;
     page-break-after: avoid;
     break-after: avoid;
 }}
 
 h1 {{
-    font-size: 22pt;
+    font-size: 20pt;
     color: #0f2942;
     border-bottom: 2.5px solid #0284c7;
-    padding-bottom: 6px;
+    padding-bottom: 5px;
     margin-top: 0;
 }}
 
 h2 {{
-    font-size: 14pt;
+    font-size: 13.5pt;
     color: #0369a1;
     border-bottom: 1.2px solid #e2e8f0;
     padding-bottom: 4px;
-    margin-top: 24pt;
+    margin-top: 20pt;
 }}
 
 h3 {{
-    font-size: 11.5pt;
+    font-size: 11pt;
     color: #0f172a;
-    margin-top: 16pt;
+    margin-top: 14pt;
 }}
 
 h4 {{
-    font-size: 10.5pt;
+    font-size: 10pt;
     color: #334155;
+    margin-top: 10pt;
 }}
 
 p {{
-    margin-top: 0.6em;
-    margin-bottom: 0.8em;
+    margin-top: 0.5em;
+    margin-bottom: 0.7em;
     text-align: justify;
     text-justify: inter-word;
 }}
@@ -213,15 +252,15 @@ hr {{
     border: none;
     height: 1px;
     background-color: #cbd5e1;
-    margin: 24pt 0;
+    margin: 20pt 0;
 }}
 
 /* Tables */
 table {{
     width: 100%;
     border-collapse: collapse;
-    margin: 14pt 0;
-    font-size: 8.8pt;
+    margin: 12pt 0;
+    font-size: 8.5pt;
     page-break-inside: avoid;
     break-inside: avoid;
 }}
@@ -231,13 +270,13 @@ table th {{
     color: #0f172a;
     font-weight: 700;
     text-align: left;
-    padding: 8px 10px;
+    padding: 7px 9px;
     border-top: 1.5px solid #0f172a;
     border-bottom: 1.5px solid #0f172a;
 }}
 
 table td {{
-    padding: 7px 10px;
+    padding: 6px 9px;
     border-bottom: 1px solid #e2e8f0;
     color: #334155;
 }}
@@ -251,22 +290,22 @@ pre {{
     background-color: #f8fafc;
     border: 1px solid #e2e8f0;
     border-radius: 6px;
-    padding: 10px 14px;
+    padding: 8px 12px;
     font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
-    font-size: 7.8pt;
-    line-height: 1.45;
+    font-size: 7.5pt;
+    line-height: 1.4;
     color: #0f172a;
     overflow-x: auto;
-    margin: 12pt 0;
+    margin: 10pt 0;
     page-break-inside: avoid;
     break-inside: avoid;
 }}
 
 code {{
     font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
-    font-size: 8.5pt;
+    font-size: 8.2pt;
     background-color: #f1f5f9;
-    padding: 2px 5px;
+    padding: 2px 4px;
     border-radius: 4px;
     color: #0f2942;
 }}
@@ -282,10 +321,10 @@ pre code {{
 .callout {{
     border-left: 4px solid #0284c7;
     background-color: #f0f9ff;
-    padding: 10px 14px;
-    margin: 12pt 0;
+    padding: 9px 13px;
+    margin: 11pt 0;
     border-radius: 0 6px 6px 0;
-    font-size: 9.2pt;
+    font-size: 9pt;
     page-break-inside: avoid;
     break-inside: avoid;
 }}
@@ -293,7 +332,7 @@ pre code {{
 .callout-header {{
     font-weight: 700;
     color: #0369a1;
-    margin-bottom: 4px;
+    margin-bottom: 3px;
     display: flex;
     align-items: center;
     gap: 6px;
@@ -303,19 +342,20 @@ pre code {{
     color: #334155;
 }}
 
-/* Figures Gallery */
+/* Figures Gallery & Cards */
 .figures-gallery {{
     display: flex;
     flex-direction: column;
-    gap: 16pt;
-    margin: 16pt 0;
+    gap: 14pt;
+    margin: 14pt 0;
 }}
 
 .figure-card {{
     background-color: #ffffff;
-    border: 1px solid #e2e8f0;
+    border: 1px solid #cbd5e1;
     border-radius: 6px;
-    padding: 10px;
+    padding: 8px;
+    margin: 12pt 0;
     text-align: center;
     page-break-inside: avoid;
     break-inside: avoid;
@@ -330,35 +370,27 @@ pre code {{
 }}
 
 .figure-caption {{
-    margin-top: 8px;
-    font-size: 8.8pt;
-    color: #475569;
+    margin-top: 6px;
+    font-size: 8.5pt;
+    font-weight: 600;
+    color: #334155;
 }}
 
 /* Lists */
 ul, ol {{
-    margin-top: 0.4em;
-    margin-bottom: 0.8em;
-    padding-left: 22px;
+    margin-top: 0.3em;
+    margin-bottom: 0.7em;
+    padding-left: 20px;
 }}
 
 li {{
-    margin-bottom: 0.3em;
+    margin-bottom: 0.25em;
 }}
 
 .file-ref code {{
     background-color: #e0f2fe;
     color: #0369a1;
     font-weight: 600;
-}}
-
-/* Clean up header decoration */
-.header-sub {{
-    color: #64748b;
-    font-size: 12pt;
-    margin-top: -8px;
-    margin-bottom: 20px;
-    font-weight: 500;
 }}
 </style>
 </head>
@@ -374,7 +406,7 @@ def main():
         md_text = f.read()
 
     # Preprocess
-    print("[PDF Export] Preprocessing markdown (carousels, callouts, base64 images, math)...")
+    print("[PDF Export] Preprocessing markdown (images, callouts, base64 encoding, math)...")
     preprocessed_md, math_blocks = preprocess_markdown(md_text)
 
     # Convert to HTML via python-markdown with tables & attr_list extensions
@@ -400,7 +432,7 @@ def main():
         "--headless=new",
         "--disable-gpu",
         "--run-all-compositor-stages-before-draw",
-        "--virtual-time-budget=10000",
+        "--virtual-time-budget=12000",
         f"--print-to-pdf={PDF_OUT_PATH}",
         HTML_OUT_PATH
     ]
